@@ -454,9 +454,6 @@ mod tests {
                 ready.send(()).expect("signal");
                 let mut total = 0usize;
                 let mut buffer = vec![0u8; 32 * 1024];
-                // Stops at SIZE rather than reading to end of stream, so the
-                // test does not sit waiting out a timeout for a close that
-                // tells it nothing it does not already know.
                 while total < SIZE {
                     let read = tls.read(&mut buffer).await.expect("read");
                     if read == 0 {
@@ -469,6 +466,16 @@ mod tests {
                     total += read;
                 }
                 assert_eq!(total, SIZE, "did not receive the whole payload");
+
+                // Then wait for the peer's close_notify before letting this
+                // pipe drop. Returning as soon as the payload was counted
+                // meant the client could still be sending its close into an
+                // end nobody held any more, which is EPIPE: that raced on a
+                // fast machine and lost on a two core runner, where it failed
+                // the 0.1.1 release. There is no timeout to sit through,
+                // because the client sends the close immediately.
+                let read = tls.read(&mut buffer).await.expect("read after payload");
+                assert_eq!(read, 0, "expected the peer's close, got more data");
             });
         });
 
