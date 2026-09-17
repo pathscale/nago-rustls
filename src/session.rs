@@ -329,9 +329,17 @@ mod tests {
     impl ByteStream for Pipe {
         async fn read(&mut self, buffer: &mut [u8]) -> Result<usize> {
             while self.pending.is_empty() {
-                match self.incoming.recv() {
+                // Bounded rather than a blocking recv. The two ends take turns
+                // during a handshake, so a blocking wait here parks the thread
+                // inside a poll and the test hangs forever instead of failing.
+                // A timeout turns that into a visible failure.
+                match self
+                    .incoming
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                {
                     Ok(chunk) => self.pending = chunk,
-                    // The far end went away, which is end of stream.
+                    // The far end went away, or stopped talking: either way
+                    // there is nothing more to read.
                     Err(_) => return Ok(0),
                 }
             }
@@ -427,17 +435,24 @@ mod tests {
 
     #[test]
     fn a_payload_spanning_many_records_round_trips() {
-        // TLS records cap at 16 KiB, so this necessarily spans several and
-        // exercises the loop that reassembles them.
-        const SIZE: usize = 200 * 1024;
+        // Just past the 16 KiB record cap, which is all it takes to span
+        // more than one and exercise the loop that reassembles them. Larger
+        // measures the cipher rather than this crate.
+        const SIZE: usize = 48 * 1024;
         let (server_config, client_config) = certificate();
         let (client_pipe, server_pipe) = pipes();
 
+        // The server signals once it is past the handshake. Without this the
+        // client can fill the channel with record after record while the
+        // server is still exchanging handshake messages, and the send blocks
+        // in a direction the peer is not reading.
+        let (ready, started) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
             let session = ServerConnection::new(server_config).expect("session");
             let mut tls = TlsSession::server(server_pipe, session);
             block_on(async move {
                 tls.handshake().await.expect("handshake");
+                ready.send(()).expect("signal");
                 let mut total = 0usize;
                 let mut buffer = vec![0u8; 32 * 1024];
                 while total < SIZE {
@@ -460,6 +475,7 @@ mod tests {
         let mut tls = TlsSession::client(client_pipe, session);
         block_on(async move {
             tls.handshake().await.expect("handshake");
+            started.recv().expect("server never finished its handshake");
             tls.write_all(&vec![0x5Au8; SIZE]).await.expect("write");
             tls.close().await.expect("close");
         });
