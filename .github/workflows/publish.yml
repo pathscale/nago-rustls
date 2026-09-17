@@ -20,6 +20,8 @@ jobs:
     runs-on: ubicloud-standard-2
     steps:
       - uses: actions/checkout@v4
+      - name: Clone the sibling path dependency
+        run: git clone --depth 1 https://github.com/pathscale/nagoya.git ../nagoya
       - uses: dtolnay/rust-toolchain@stable
 
       # The registry is the only authority on what is already released.
