@@ -1,84 +1,35 @@
-//! Errors from the kernel, as a code rather than a boxed type.
+//! Errors, which are nagoya's.
 //!
-//! An `Errno` is what every syscall in this crate actually returns. Wrapping
-//! it in `std::io::Error` means an allocation-capable type carrying a code,
-//! and more importantly means `WouldBlock` arrives as an error variant when it
-//! is the ordinary state of a reactive socket rather than a failure.
-//!
-//! So the code is kept as a code, and the question a caller actually asks -
-//! is this "not ready" or a real failure - is a method rather than a match on
-//! an error kind.
+//! The code a syscall left behind, rather than a boxed type: the question a
+//! caller asks of a failed read is whether it means "not ready yet", which is
+//! a comparison rather than a downcast. nagoya's `StreamError` is that, and
+//! taking it from there keeps one definition rather than two that have to be
+//! converted at every boundary.
 
-// Reading this thread's errno is a dereference of a pointer libc hands out.
-#![allow(unsafe_code)]
+pub use nagoya::io::StreamError as Errno;
 
-/// A raw platform error number.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Errno(pub i32);
-
-/// The result of a syscall.
+/// The result of an operation on a stream.
 pub type Result<T> = core::result::Result<T, Errno>;
 
-impl Errno {
-    /// The error the last failing syscall left behind.
-    pub fn last() -> Self {
-        // SAFETY: `__errno_location`/`__error` return a pointer to this
-        // thread's errno, valid for the life of the thread.
-        #[cfg(target_os = "linux")]
-        let value = unsafe { *libc::__errno_location() };
-        #[cfg(not(target_os = "linux"))]
-        let value = unsafe { *libc::__error() };
-        Self(value)
-    }
+/// The handful of codes this crate reports for itself.
+///
+/// Spelled out rather than taken from libc, which this crate would otherwise
+/// not need at all. All three are the same number on every platform it
+/// targets, unlike `EAGAIN`, which is why nagoya spells that one per target
+/// and these can sit here.
+pub mod codes {
+    use super::Errno;
 
-    /// Whether this means "nothing to do yet" rather than a failure.
-    ///
-    /// POSIX allows `EAGAIN` and `EWOULDBLOCK` to differ and does not say
-    /// which a given call returns, so both are checked.
-    #[inline]
-    pub fn would_block(self) -> bool {
-        self.0 == libc::EAGAIN || self.0 == libc::EWOULDBLOCK
-    }
+    /// The peer hung up mid handshake.
+    pub const CONNECTION_RESET: Errno = Errno(54);
 
-    /// Whether the call was interrupted by a signal and should be retried.
-    #[inline]
-    pub fn interrupted(self) -> bool {
-        self.0 == libc::EINTR
-    }
+    /// rustls reported a state this crate cannot continue from.
+    pub const IO: Errno = Errno(5);
 
-    /// Whether the peer is gone.
-    #[inline]
-    pub fn disconnected(self) -> bool {
-        matches!(
-            self.0,
-            libc::EPIPE | libc::ECONNRESET | libc::ENOTCONN | libc::ESHUTDOWN
-        )
-    }
+    /// A protocol error from the peer: an attack, or a broken implementation.
+    /// Either way the session is finished.
+    pub const PROTOCOL: Errno = Errno(100);
 
-    /// Whether an `accept` failure concerns only the connection being accepted.
-    ///
-    /// A peer that resets between the readiness notification and the accept
-    /// produces one of these. Failing the listener on one would let any client
-    /// take a server down by connecting and immediately resetting.
-    #[inline]
-    pub fn transient_accept(self) -> bool {
-        matches!(
-            self.0,
-            libc::ECONNABORTED | libc::ECONNRESET | libc::ECONNREFUSED
-        )
-    }
-}
-
-impl core::fmt::Display for Errno {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(formatter, "errno {}", self.0)
-    }
-}
-
-impl std::error::Error for Errno {}
-
-impl From<Errno> for std::io::Error {
-    fn from(value: Errno) -> Self {
-        Self::from_raw_os_error(value.0)
-    }
+    /// The far end is gone and a write has nowhere to go.
+    pub const BROKEN_PIPE: Errno = Errno(32);
 }

@@ -37,7 +37,7 @@ use std::io::{Read as _, Write as _};
 
 use rustls::{ClientConnection, ServerConnection};
 
-use crate::error::{Errno, Result};
+use crate::error::{codes, Result};
 use crate::stream::ByteStream;
 
 /// A TLS session over a byte stream.
@@ -118,7 +118,7 @@ impl<S: ByteStream> TlsSession<S> {
             // Only wait for the peer when there was nothing left to send:
             // reading first would deadlock a handshake whose next move is ours.
             if !wrote && self.fill_incoming().await? == 0 {
-                return Err(Errno(libc::ECONNRESET));
+                return Err(codes::CONNECTION_RESET);
             }
         }
         // The last flight of the handshake is still in the buffer.
@@ -136,7 +136,7 @@ impl<S: ByteStream> TlsSession<S> {
             let mut buffer = Vec::new();
             // Writing into a Vec cannot fail, so the error is a rustls state
             // problem rather than an I/O one.
-            session!(self, write_tls(&mut buffer)).map_err(|_| Errno(libc::EIO))?;
+            session!(self, write_tls(&mut buffer)).map_err(|_| codes::IO)?;
             if buffer.is_empty() {
                 break;
             }
@@ -160,14 +160,14 @@ impl<S: ByteStream> TlsSession<S> {
         while !cursor.is_empty() {
             // `read_tls` takes as much as its internal buffer allows, which
             // may be less than offered, so this loops rather than assuming.
-            let taken = session!(self, read_tls(&mut cursor)).map_err(|_| Errno(libc::EIO))?;
+            let taken = session!(self, read_tls(&mut cursor)).map_err(|_| codes::IO)?;
             if taken == 0 {
                 break;
             }
             let state = session!(self, process_new_packets())
                 // A protocol error here is an attack or a broken peer; either
                 // way the connection is finished.
-                .map_err(|_| Errno(libc::EPROTO))?;
+                .map_err(|_| codes::PROTOCOL)?;
 
             let available = state.plaintext_bytes_to_read();
             if available > 0 {
@@ -218,12 +218,11 @@ impl<S: ByteStream> TlsSession<S> {
             // rustls buffers the plaintext and encrypts on `write_tls`, so a
             // short accept here just means its buffer is full and needs
             // draining to the socket.
-            let took = session!(self, writer().write(&buffer[written..]))
-                .map_err(|_| Errno(libc::EIO))?;
+            let took = session!(self, writer().write(&buffer[written..])).map_err(|_| codes::IO)?;
             written += took;
             self.flush_outgoing().await?;
             if took == 0 {
-                return Err(Errno(libc::EIO));
+                return Err(codes::IO);
             }
         }
         Ok(())
@@ -285,6 +284,7 @@ pub fn default_client_config() -> alloc::sync::Arc<rustls::ClientConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::codes;
     use alloc::sync::Arc;
     use alloc::vec;
     use rustls::{ClientConnection, ServerConnection};
@@ -300,8 +300,7 @@ mod tests {
         let issued = rcgen::generate_simple_self_signed(["localhost".to_string()])
             .expect("generate certificate");
         let certificate = CertificateDer::from(issued.cert.der().to_vec());
-        let key =
-            PrivateKeyDer::try_from(issued.signing_key.serialize_der()).expect("private key");
+        let key = PrivateKeyDer::try_from(issued.signing_key.serialize_der()).expect("private key");
 
         let server = rustls::ServerConfig::builder()
             .with_no_client_auth()
@@ -352,7 +351,7 @@ mod tests {
         async fn write_all(&mut self, buffer: &[u8]) -> Result<()> {
             self.outgoing
                 .send(buffer.to_vec())
-                .map_err(|_| Errno(libc::EPIPE))
+                .map_err(|_| codes::BROKEN_PIPE)
         }
     }
 

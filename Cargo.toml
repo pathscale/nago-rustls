@@ -23,8 +23,11 @@ webpki-roots = ["dep:webpki-roots"]
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 rustls-pki-types = "1"
 webpki-roots = { version = "1", optional = true }
-# For the errno a stream reports. Nothing else in the crate needs a platform.
-libc = { version = "^0.2.189", default-features = false }
+# The byte stream trait and its error live here. nagoya is the lower layer, so
+# this direction is the only one available: nagoya cannot depend on a TLS
+# crate. Taking the definition from there rather than restating it means a
+# consumer that uses both writes no bridge.
+nagoya = { version = "^0.1.3", path = "../nagoya", default-features = false }
 
 [dev-dependencies]
 # Certificates generated in process. A committed one expires and then the
