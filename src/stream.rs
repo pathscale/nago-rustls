@@ -13,6 +13,18 @@
 //! whether it is speaking through TLS.
 //!
 //! [`TlsSession`]: crate::TlsSession
+//!
+//! # Why not nagoya's `io::Stream`
+//!
+//! nagoya 0.1.3 has the same two methods, and taking them from there would
+//! spare a consumer that uses both crates the bridge between two identical
+//! definitions. It would also pull a work-stealing scheduler, its queues and
+//! the futures machinery around them, thirteen crates, into a TLS crate that
+//! runs none of it.
+//!
+//! That is the `tokio-rustls` mistake at smaller scale: a glue crate carrying
+//! a runtime because that is where the trait happened to live. A consumer with
+//! both writes a few lines of bridge instead, which is the cheaper of the two.
 
 use crate::error::Result;
 
