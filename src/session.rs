@@ -335,7 +335,7 @@ mod tests {
                 // A timeout turns that into a visible failure.
                 match self
                     .incoming
-                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .recv_timeout(std::time::Duration::from_millis(500))
                 {
                     Ok(chunk) => self.pending = chunk,
                     // The far end went away, or stopped talking: either way
@@ -455,6 +455,9 @@ mod tests {
                 ready.send(()).expect("signal");
                 let mut total = 0usize;
                 let mut buffer = vec![0u8; 32 * 1024];
+                // Stops at SIZE rather than reading to end of stream, so the
+                // test does not sit waiting out a timeout for a close that
+                // tells it nothing it does not already know.
                 while total < SIZE {
                     let read = tls.read(&mut buffer).await.expect("read");
                     if read == 0 {
