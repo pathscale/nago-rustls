@@ -1,0 +1,32 @@
+[package]
+name = "nago-rustls"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Drive rustls from any async byte stream, with no runtime attached. No OpenSSL, no C: rustls and ring all the way down"
+repository = "https://github.com/pathscale/nago-rustls"
+readme = "README.md"
+keywords = ["tls", "rustls", "sans-io", "async", "no-runtime"]
+categories = ["network-programming", "asynchronous", "cryptography"]
+
+[features]
+default = ["webpki-roots"]
+# A ready-made client config trusting the usual roots. Off, this crate has no
+# opinion about who to trust and the caller supplies the config.
+webpki-roots = ["dep:webpki-roots"]
+
+[dependencies]
+# Already sans-io: read_tls, write_tls and process_new_packets take byte
+# buffers and know nothing about a runtime. That is why this crate is glue
+# rather than a fork.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+rustls-pki-types = "1"
+webpki-roots = { version = "1", optional = true }
+# For the errno a stream reports. Nothing else in the crate needs a platform.
+libc = { version = "^0.2.189", default-features = false }
+
+[dev-dependencies]
+# Certificates generated in process. A committed one expires and then the
+# suite fails for reasons unrelated to the code.
+rcgen = "0.14"
