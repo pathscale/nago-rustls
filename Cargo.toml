@@ -1,10 +1,10 @@
 [package]
 name = "nago-rustls"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
-description = "Drive rustls from any async byte stream, with no runtime attached. No OpenSSL, no C: rustls and ring all the way down"
+description = "Drive caller-configured rustls from any async byte stream, with no runtime attached"
 repository = "https://github.com/pathscale/nago-rustls"
 readme = "README.md"
 keywords = ["tls", "rustls", "sans-io", "async", "no-runtime"]
@@ -20,16 +20,18 @@ webpki-roots = ["dep:webpki-roots"]
 # Already sans-io: read_tls, write_tls and process_new_packets take byte
 # buffers and know nothing about a runtime. That is why this crate is glue
 # rather than a fork.
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
-rustls-pki-types = "1"
-webpki-roots = { version = "1", optional = true }
+# The host selects its provider explicitly. Transport must not enable ring
+# or AWS-LC through feature unification.
+rustls = { version = "^0.23", default-features = false, features = ["std", "logging", "tls12"] }
+rustls-pki-types = "^1"
+webpki-roots = { version = "^1", optional = true }
 # The byte stream trait and its error live here. nagoya is the lower layer, so
 # this direction is the only one available: nagoya cannot depend on a TLS
 # crate. Taking the definition from there rather than restating it means a
 # consumer that uses both writes no bridge.
-nagoya = { version = "^0.1.3", path = "../nagoya", default-features = false }
+nagoya = { version = "^0.1.15", default-features = false }
 
 [dev-dependencies]
 # Certificates generated in process. A committed one expires and then the
 # suite fails for reasons unrelated to the code.
-rcgen = "0.14"
+rcgen = "^0.14"

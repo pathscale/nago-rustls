@@ -22,8 +22,9 @@
 //! and all the protocol is rustls'. This is the plumbing around it, and it is
 //! deliberately small enough to read in one sitting.
 //!
-//! There is no OpenSSL here and no C at all. rustls with the `ring` provider
-//! is the whole backend, which is the point of naming the crate after it.
+//! The host supplies a rustls configuration with an explicit crypto provider.
+//! This transport enables neither ring nor AWS-LC. Hosts using the optional
+//! default-root configuration must install their chosen process provider first.
 //!
 //! # Example
 //!
@@ -63,3 +64,4 @@ pub use session::default_client_config;
 // rustls version by hand, which is the usual way a TLS dependency goes wrong.
 pub use rustls;
 pub use rustls_pki_types;
+
