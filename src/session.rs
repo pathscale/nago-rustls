@@ -270,6 +270,24 @@ impl<S: ByteStream> TlsSession<S> {
     pub fn get_ref(&self) -> &S {
         &self.stream
     }
+
+    /// Take a client session apart after the handshake, for a caller that
+    /// drives rustls through its own poll-based loop, such as an HTTP/2
+    /// codec. Returns the stream, the rustls connection and any plaintext
+    /// already decrypted but not yet read. A server session is returned
+    /// unchanged.
+    pub fn into_client_parts(
+        self,
+    ) -> core::result::Result<(S, alloc::boxed::Box<ClientConnection>, Vec<u8>), Self> {
+        match self.session {
+            Session::Client(session) => {
+                let mut incoming = self.incoming;
+                incoming.drain(..self.taken);
+                Ok((self.stream, session, incoming))
+            }
+            session => Err(Self { session, ..self }),
+        }
+    }
 }
 
 /// A TLS session is itself a byte stream, which is the whole point: a
