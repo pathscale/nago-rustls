@@ -322,14 +322,20 @@ mod tests {
         let certificate = CertificateDer::from(issued.cert.der().to_vec());
         let key = PrivateKeyDer::try_from(issued.signing_key.serialize_der()).expect("private key");
 
-        let server = rustls::ServerConfig::builder()
+        // The host picks the provider; these tests pick the ECC-only one.
+        let provider = Arc::new(ps_rustcrypto::provider());
+        let server = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .expect("versions")
             .with_no_client_auth()
             .with_single_cert(vec![certificate.clone()], key)
             .expect("server config");
 
         let mut roots = rustls::RootCertStore::empty();
         roots.add(certificate).expect("trust the test certificate");
-        let client = rustls::ClientConfig::builder()
+        let client = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("versions")
             .with_root_certificates(roots)
             .with_no_client_auth();
 
@@ -523,8 +529,9 @@ mod tests {
         let server = std::thread::spawn(move || {
             let session = ServerConnection::new(server_config).expect("session");
             let mut tls = TlsSession::server(server_pipe, session);
-            // Fails too, once the client rejects it.
+            // Fails too, once the client rejects it, and hears why.
             let _ = block_on(tls.handshake());
+            tls.tls_error().cloned()
         });
 
         let name = ServerName::try_from("localhost").expect("name");
@@ -534,7 +541,15 @@ mod tests {
             block_on(tls.handshake()).is_err(),
             "an unknown certificate was accepted"
         );
+        // Same subject, different key: the chain fails its signature check.
+        let Some(rustls::Error::InvalidCertificate(refused)) = tls.tls_error().cloned() else {
+            panic!("no certificate error kept: {:?}", tls.tls_error());
+        };
 
-        server.join().expect("server thread");
+        // The alert reached the server rather than dying in the buffer.
+        assert_eq!(
+            server.join().expect("server thread"),
+            Some(rustls::Error::AlertReceived(refused.into()))
+        );
     }
 }

@@ -35,3 +35,5 @@ nagoya = { version = "^0.1.15", default-features = false }
 # Certificates generated in process. A committed one expires and then the
 # suite fails for reasons unrelated to the code.
 rcgen = "^0.14"
+# The provider the tests run on: ECDSA and ChaCha, with no ring or AWS-LC.
+ps-rustcrypto = "^0.3"
