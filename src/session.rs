@@ -52,6 +52,8 @@ pub struct TlsSession<S> {
     incoming: Vec<u8>,
     /// Where in `incoming` the caller has read up to.
     taken: usize,
+    /// The rustls error that ended the session, kept for the caller to report.
+    error: Option<rustls::Error>,
 }
 
 /// Which side of the handshake this is.
@@ -91,6 +93,7 @@ impl<S: ByteStream> TlsSession<S> {
             session: Session::Client(alloc::boxed::Box::new(session)),
             incoming: Vec::new(),
             taken: 0,
+            error: None,
         }
     }
 
@@ -101,7 +104,16 @@ impl<S: ByteStream> TlsSession<S> {
             session: Session::Server(alloc::boxed::Box::new(session)),
             incoming: Vec::new(),
             taken: 0,
+            error: None,
         }
+    }
+
+    /// The rustls error behind the last PROTOCOL failure, if there was one.
+    ///
+    /// The errno says the session is finished; this says why, for example
+    /// which certificate a verifier refused.
+    pub fn tls_error(&self) -> Option<&rustls::Error> {
+        self.error.as_ref()
     }
 
     /// Run the handshake to completion.
@@ -164,10 +176,18 @@ impl<S: ByteStream> TlsSession<S> {
             if taken == 0 {
                 break;
             }
-            let state = session!(self, process_new_packets())
-                // A protocol error here is an attack or a broken peer; either
-                // way the connection is finished.
-                .map_err(|_| codes::PROTOCOL)?;
+            // A protocol error here is an attack, a broken peer, or a
+            // certificate refused by policy; either way the connection is
+            // finished. rustls has queued an alert saying why, so send it
+            // before giving up, and keep the error for the caller.
+            let state = match session!(self, process_new_packets()) {
+                Ok(state) => state,
+                Err(error) => {
+                    self.error = Some(error);
+                    let _ = self.flush_outgoing().await;
+                    return Err(codes::PROTOCOL);
+                }
+            };
 
             let available = state.plaintext_bytes_to_read();
             if available > 0 {
