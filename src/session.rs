@@ -170,10 +170,15 @@ impl<S: ByteStream> TlsSession<S> {
 
         let mut cursor = &chunk[..read];
         while !cursor.is_empty() {
+            // One batch at a time. `read_tls` fails with "received plaintext
+            // buffer full" while undrained plaintext is over its limit, so
+            // whatever an earlier batch decrypted is moved out first.
+            self.drain_plaintext();
             // `read_tls` takes as much as its internal buffer allows, which
             // may be less than offered, so this loops rather than assuming.
             let taken = session!(self, read_tls(&mut cursor)).map_err(|_| codes::IO)?;
             if taken == 0 {
+                // Only after close_notify: nothing more is read in that state.
                 break;
             }
             // A protocol error here is an attack, a broken peer, or a
@@ -189,16 +194,25 @@ impl<S: ByteStream> TlsSession<S> {
                 }
             };
 
-            let available = state.plaintext_bytes_to_read();
-            if available > 0 {
-                let start = self.incoming.len();
-                self.incoming.resize(start + available, 0);
-                // Reading plaintext out of rustls cannot fail once it has
-                // reported the bytes are there.
-                let _ = session!(self, reader().read(&mut self.incoming[start..]));
+            if state.plaintext_bytes_to_read() > 0 {
+                self.drain_plaintext();
             }
         }
         Ok(read)
+    }
+
+    /// Move everything rustls has decrypted into `incoming`.
+    ///
+    /// Loops and keeps only what was actually copied, so a short read can
+    /// never leave zeroed bytes posing as plaintext.
+    fn drain_plaintext(&mut self) {
+        let mut chunk = [0u8; 16 * 1024];
+        loop {
+            match session!(self, reader().read(&mut chunk)) {
+                Ok(0) | Err(_) => break,
+                Ok(copied) => self.incoming.extend_from_slice(&chunk[..copied]),
+            }
+        }
     }
 
     /// Read decrypted bytes into `buffer`.
@@ -534,6 +548,58 @@ mod tests {
         });
 
         server.join().expect("server thread");
+    }
+
+    #[test]
+    fn a_large_reply_read_in_small_pieces_arrives_whole() {
+        // Server to client, many records in one write, read through a small
+        // buffer: the client must drain rustls between batches, or read_tls
+        // fails with "received plaintext buffer full" past 16 KiB.
+        const SIZE: usize = 96 * 1024;
+        let (server_config, client_config) = certificate();
+        let (client_pipe, server_pipe) = pipes();
+
+        let server = std::thread::spawn(move || {
+            let session = ServerConnection::new(server_config).expect("session");
+            let mut tls = TlsSession::server(server_pipe, session);
+            block_on(async move {
+                tls.handshake().await.expect("handshake");
+                let mut buffer = [0u8; 4];
+                let read = tls.read(&mut buffer).await.expect("read");
+                assert_eq!(&buffer[..read], b"send");
+                let payload: Vec<u8> = (0..SIZE).map(|index| (index % 251) as u8).collect();
+                tls.write_all(&payload).await.expect("write");
+                tls.close().await.expect("close");
+            });
+        });
+
+        let name = ServerName::try_from("localhost").expect("name");
+        let session = ClientConnection::new(client_config, name).expect("session");
+        let mut tls = TlsSession::client(client_pipe, session);
+        let received = block_on(async move {
+            tls.handshake().await.expect("handshake");
+            tls.write_all(b"send").await.expect("write");
+            let mut received = Vec::new();
+            let mut buffer = [0u8; 1000];
+            loop {
+                let read = tls.read(&mut buffer).await.expect("read");
+                if read == 0 {
+                    break;
+                }
+                received.extend_from_slice(&buffer[..read]);
+            }
+            received
+        });
+        server.join().expect("server thread");
+
+        assert_eq!(received.len(), SIZE, "did not receive the whole reply");
+        assert!(
+            received
+                .iter()
+                .enumerate()
+                .all(|(index, byte)| *byte == (index % 251) as u8),
+            "reply corrupted through TLS"
+        );
     }
 
     #[test]
