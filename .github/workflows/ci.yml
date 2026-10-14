@@ -13,6 +13,8 @@ jobs:
         rust: [stable, '1.85.0']
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Clone the sibling path dependency
         run: git clone --depth 1 https://github.com/pathscale/nagoya.git ../nagoya
       - uses: dtolnay/rust-toolchain@master
@@ -25,6 +27,8 @@ jobs:
     runs-on: ubicloud-standard-2
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Clone the sibling path dependency
         run: git clone --depth 1 https://github.com/pathscale/nagoya.git ../nagoya
       - uses: dtolnay/rust-toolchain@stable
