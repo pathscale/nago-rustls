@@ -54,6 +54,7 @@ pub struct TlsSession<S> {
     taken: usize,
     /// The rustls error that ended the session, kept for the caller to report.
     error: Option<rustls::Error>,
+    peer_closed: bool,
 }
 
 /// Which side of the handshake this is.
@@ -94,6 +95,7 @@ impl<S: ByteStream> TlsSession<S> {
             incoming: Vec::new(),
             taken: 0,
             error: None,
+            peer_closed: false,
         }
     }
 
@@ -105,6 +107,7 @@ impl<S: ByteStream> TlsSession<S> {
             incoming: Vec::new(),
             taken: 0,
             error: None,
+            peer_closed: false,
         }
     }
 
@@ -165,7 +168,11 @@ impl<S: ByteStream> TlsSession<S> {
         let mut chunk = [0u8; 16 * 1024];
         let read = self.stream.read(&mut chunk).await?;
         if read == 0 {
-            return Ok(0);
+            return if self.peer_closed {
+                Ok(0)
+            } else {
+                Err(codes::CONNECTION_RESET)
+            };
         }
 
         let mut cursor = &chunk[..read];
@@ -173,7 +180,7 @@ impl<S: ByteStream> TlsSession<S> {
             // One batch at a time. `read_tls` fails with "received plaintext
             // buffer full" while undrained plaintext is over its limit, so
             // whatever an earlier batch decrypted is moved out first.
-            self.drain_plaintext();
+            self.drain_plaintext()?;
             // `read_tls` takes as much as its internal buffer allows, which
             // may be less than offered, so this loops rather than assuming.
             let taken = session!(self, read_tls(&mut cursor)).map_err(|_| codes::IO)?;
@@ -194,8 +201,9 @@ impl<S: ByteStream> TlsSession<S> {
                 }
             };
 
+            self.peer_closed |= state.peer_has_closed();
             if state.plaintext_bytes_to_read() > 0 {
-                self.drain_plaintext();
+                self.drain_plaintext()?;
             }
         }
         Ok(read)
@@ -205,20 +213,29 @@ impl<S: ByteStream> TlsSession<S> {
     ///
     /// Loops and keeps only what was actually copied, so a short read can
     /// never leave zeroed bytes posing as plaintext.
-    fn drain_plaintext(&mut self) {
+    fn drain_plaintext(&mut self) -> Result<()> {
         let mut chunk = [0u8; 16 * 1024];
         loop {
             match session!(self, reader().read(&mut chunk)) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    return Err(codes::CONNECTION_RESET);
+                }
+                Err(_) => return Err(codes::IO),
                 Ok(copied) => self.incoming.extend_from_slice(&chunk[..copied]),
             }
         }
+        Ok(())
     }
 
     /// Read decrypted bytes into `buffer`.
     ///
     /// Returns zero when the peer has closed the session cleanly.
     pub async fn read(&mut self, buffer: &mut [u8]) -> Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
         loop {
             // Serve what has already been decrypted before going to the socket.
             if self.taken < self.incoming.len() {
@@ -233,6 +250,10 @@ impl<S: ByteStream> TlsSession<S> {
                     self.taken = 0;
                 }
                 return Ok(take);
+            }
+
+            if self.peer_closed {
+                return Ok(0);
             }
 
             // rustls may owe the peer a message even on a read: a key update
