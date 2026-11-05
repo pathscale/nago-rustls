@@ -14,9 +14,9 @@ pub type Result<T> = core::result::Result<T, Errno>;
 /// The handful of codes this crate reports for itself.
 ///
 /// Spelled out rather than taken from libc, which this crate would otherwise
-/// not need at all. All three are the same number on every platform it
-/// targets, unlike `EAGAIN`, which is why nagoya spells that one per target
-/// and these can sit here.
+/// not need at all. The reset and protocol values are currently not mapped for
+/// every supported target; see `docs/TODO.md` before relying on them across
+/// platforms.
 pub mod codes {
     use super::Errno;
 
