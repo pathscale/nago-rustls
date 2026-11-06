@@ -362,7 +362,6 @@ mod tests {
     use alloc::vec;
     use rustls::{ClientConnection, ServerConnection};
     use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-    use std::io::Write as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::{Receiver, SyncSender};
     use std::sync::Arc as StdArc;
