@@ -362,7 +362,10 @@ mod tests {
     use alloc::vec;
     use rustls::{ClientConnection, ServerConnection};
     use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::{Receiver, SyncSender};
+    use std::sync::Arc as StdArc;
 
     /// A self signed certificate for `localhost`, and a client config that
     /// trusts exactly it.
@@ -402,10 +405,13 @@ mod tests {
         outgoing: SyncSender<Vec<u8>>,
         incoming: Receiver<Vec<u8>>,
         pending: Vec<u8>,
+        reads: StdArc<AtomicUsize>,
+        writes: StdArc<AtomicUsize>,
     }
 
     impl ByteStream for Pipe {
         async fn read(&mut self, buffer: &mut [u8]) -> Result<usize> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
             while self.pending.is_empty() {
                 // Bounded rather than a blocking recv. The two ends take turns
                 // during a handshake, so a blocking wait here parks the thread
@@ -416,9 +422,10 @@ mod tests {
                     .recv_timeout(std::time::Duration::from_millis(500))
                 {
                     Ok(chunk) => self.pending = chunk,
-                    // The far end went away, or stopped talking: either way
-                    // there is nothing more to read.
-                    Err(_) => return Ok(0),
+                    // A real disconnect is transport EOF. A stalled fixture
+                    // is an I/O failure, so it cannot masquerade as closure.
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(0),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return Err(codes::IO),
                 }
             }
             let take = self.pending.len().min(buffer.len());
@@ -428,6 +435,7 @@ mod tests {
         }
 
         async fn write_all(&mut self, buffer: &[u8]) -> Result<()> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
             self.outgoing
                 .send(buffer.to_vec())
                 .map_err(|_| codes::BROKEN_PIPE)
@@ -442,11 +450,15 @@ mod tests {
                 outgoing: to_server,
                 incoming: client_receives,
                 pending: Vec::new(),
+                reads: StdArc::new(AtomicUsize::new(0)),
+                writes: StdArc::new(AtomicUsize::new(0)),
             },
             Pipe {
                 outgoing: to_client,
                 incoming: server_receives,
                 pending: Vec::new(),
+                reads: StdArc::new(AtomicUsize::new(0)),
+                writes: StdArc::new(AtomicUsize::new(0)),
             },
         )
     }
@@ -621,6 +633,241 @@ mod tests {
                 .all(|(index, byte)| *byte == (index % 251) as u8),
             "reply corrupted through TLS"
         );
+    }
+
+    #[test]
+    fn closure_truncated_transport_returns_reset_after_plaintext() {
+        const PAYLOAD: &[u8] = b"truncated";
+        let (server_config, client_config) = certificate();
+        let (client_pipe, server_pipe) = pipes();
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+
+        let server = std::thread::spawn(move || {
+            let session = ServerConnection::new(server_config).expect("session");
+            let mut tls = TlsSession::server(server_pipe, session);
+            block_on(async move {
+                tls.handshake().await.expect("handshake");
+                ready_tx.send(()).expect("signal handshake completion");
+                let mut buffer = [0u8; 3];
+                let mut received = Vec::new();
+                while received.len() < PAYLOAD.len() {
+                    let read = ByteStream::read(&mut tls, &mut buffer)
+                        .await
+                        .expect("payload read");
+                    assert_ne!(read, 0, "transport closed before the payload arrived");
+                    received.extend_from_slice(&buffer[..read]);
+                }
+                assert_eq!(received, PAYLOAD, "plaintext bytes or order changed");
+                assert_eq!(
+                    ByteStream::read(&mut tls, &mut buffer).await,
+                    Err(codes::CONNECTION_RESET),
+                    "transport EOF without close_notify must reset after plaintext"
+                );
+            });
+        });
+
+        let name = ServerName::try_from("localhost").expect("name");
+        let session = ClientConnection::new(client_config, name).expect("session");
+        let mut tls = TlsSession::client(client_pipe, session);
+        block_on(async move {
+            tls.handshake().await.expect("handshake");
+            ready_rx
+                .recv()
+                .expect("server never finished its handshake");
+            tls.write_all(PAYLOAD).await.expect("write payload");
+            // Dropping the session drops its sending pipe without close_notify.
+            drop(tls);
+        });
+
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn closure_close_notify_drains_plaintext_then_repeats_eof() {
+        const PAYLOAD: &[u8] = b"close-notify-payload";
+        let (server_config, client_config) = certificate();
+        let (client_pipe, server_pipe) = pipes();
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+
+        let server = std::thread::spawn(move || {
+            let session = ServerConnection::new(server_config).expect("session");
+            let mut tls = TlsSession::server(server_pipe, session);
+            block_on(async move {
+                tls.handshake().await.expect("handshake");
+                ready_tx.send(()).expect("signal handshake completion");
+                let mut short = [0u8; 2];
+                let transport_reads = tls.get_ref().reads.load(Ordering::SeqCst);
+                let read = ByteStream::read(&mut tls, &mut short)
+                    .await
+                    .expect("first read");
+                assert_eq!(&short[..read], &PAYLOAD[..2]);
+                assert_eq!(
+                    tls.get_ref().reads.load(Ordering::SeqCst),
+                    transport_reads + 1
+                );
+                assert!(
+                    tls.peer_closed,
+                    "the first transport read must include close_notify"
+                );
+                assert!(
+                    tls.incoming.len() > tls.taken,
+                    "plaintext remainder should be buffered"
+                );
+
+                let cursor = tls.taken;
+                let reads = tls.get_ref().reads.load(Ordering::SeqCst);
+                let writes = tls.get_ref().writes.load(Ordering::SeqCst);
+                let mut empty = [];
+                assert_eq!(
+                    ByteStream::read(&mut tls, &mut empty)
+                        .await
+                        .expect("empty read"),
+                    0
+                );
+                assert_eq!(
+                    tls.taken, cursor,
+                    "empty read advanced the plaintext cursor"
+                );
+                assert_eq!(tls.get_ref().reads.load(Ordering::SeqCst), reads);
+                assert_eq!(tls.get_ref().writes.load(Ordering::SeqCst), writes);
+
+                let mut remainder = [0u8; 32];
+                let read = ByteStream::read(&mut tls, &mut remainder)
+                    .await
+                    .expect("remainder");
+                assert_eq!(&remainder[..read], &PAYLOAD[2..]);
+                assert_eq!(
+                    tls.incoming.len(),
+                    tls.taken,
+                    "buffered plaintext was not drained"
+                );
+
+                let reads = tls.get_ref().reads.load(Ordering::SeqCst);
+                let writes = tls.get_ref().writes.load(Ordering::SeqCst);
+                let mut nonempty = [0u8; 1];
+                assert_eq!(
+                    ByteStream::read(&mut tls, &mut nonempty)
+                        .await
+                        .expect("first EOF"),
+                    0
+                );
+                assert_eq!(
+                    ByteStream::read(&mut tls, &mut nonempty)
+                        .await
+                        .expect("repeated EOF"),
+                    0
+                );
+                assert_eq!(
+                    tls.get_ref().reads.load(Ordering::SeqCst),
+                    reads,
+                    "clean EOF touched transport reads"
+                );
+                assert_eq!(
+                    tls.get_ref().writes.load(Ordering::SeqCst),
+                    writes,
+                    "clean EOF touched transport writes"
+                );
+            });
+        });
+
+        let name = ServerName::try_from("localhost").expect("name");
+        let session = ClientConnection::new(client_config, name).expect("session");
+        let mut tls = TlsSession::client(client_pipe, session);
+        block_on(async move {
+            tls.handshake().await.expect("handshake");
+            ready_rx
+                .recv()
+                .expect("server never finished its handshake");
+            let queued = session!(tls, writer().write(PAYLOAD)).expect("queue plaintext");
+            assert_eq!(queued, PAYLOAD.len());
+            // One flush sends queued application data followed by close_notify.
+            tls.close().await.expect("close");
+        });
+
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn closure_empty_read_preserves_buffer_and_skips_io() {
+        const PAYLOAD: &[u8] = b"buffered";
+        let (server_config, client_config) = certificate();
+        let (client_pipe, server_pipe) = pipes();
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+        let (send_payload_tx, send_payload_rx) = std::sync::mpsc::sync_channel(0);
+        let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(0);
+
+        let server = std::thread::spawn(move || {
+            let session = ServerConnection::new(server_config).expect("session");
+            let mut tls = TlsSession::server(server_pipe, session);
+            block_on(async move {
+                tls.handshake().await.expect("handshake");
+                ready_tx.send(()).expect("signal handshake completion");
+                send_payload_rx
+                    .recv()
+                    .expect("client did not request payload");
+                tls.write_all(PAYLOAD).await.expect("write payload");
+                finished_rx.recv().expect("client did not finish");
+            });
+        });
+
+        let name = ServerName::try_from("localhost").expect("name");
+        let session = ClientConnection::new(client_config, name).expect("session");
+        let mut tls = TlsSession::client(client_pipe, session);
+        block_on(async move {
+            tls.handshake().await.expect("handshake");
+            ready_rx
+                .recv()
+                .expect("server never finished its handshake");
+
+            let reads = tls.get_ref().reads.load(Ordering::SeqCst);
+            let writes = tls.get_ref().writes.load(Ordering::SeqCst);
+            let mut empty = [];
+            assert_eq!(
+                ByteStream::read(&mut tls, &mut empty)
+                    .await
+                    .expect("open empty read"),
+                0
+            );
+            assert_eq!(tls.get_ref().reads.load(Ordering::SeqCst), reads);
+            assert_eq!(tls.get_ref().writes.load(Ordering::SeqCst), writes);
+
+            send_payload_tx
+                .send(())
+                .expect("signal server to send payload");
+            let mut short = [0u8; 3];
+            let read = ByteStream::read(&mut tls, &mut short)
+                .await
+                .expect("short read");
+            assert_eq!(&short[..read], &PAYLOAD[..3]);
+            assert!(
+                tls.incoming.len() > tls.taken,
+                "short read should leave plaintext buffered"
+            );
+            let cursor = tls.taken;
+            let reads = tls.get_ref().reads.load(Ordering::SeqCst);
+            let writes = tls.get_ref().writes.load(Ordering::SeqCst);
+            assert_eq!(
+                ByteStream::read(&mut tls, &mut empty)
+                    .await
+                    .expect("buffered empty read"),
+                0
+            );
+            assert_eq!(
+                tls.taken, cursor,
+                "empty read advanced the plaintext cursor"
+            );
+            assert_eq!(tls.get_ref().reads.load(Ordering::SeqCst), reads);
+            assert_eq!(tls.get_ref().writes.load(Ordering::SeqCst), writes);
+
+            let mut remainder = [0u8; 8];
+            let read = ByteStream::read(&mut tls, &mut remainder)
+                .await
+                .expect("buffered remainder");
+            assert_eq!(&remainder[..read], &PAYLOAD[3..]);
+            finished_tx.send(()).expect("signal completion");
+        });
+
+        server.join().expect("server thread");
     }
 
     #[test]
