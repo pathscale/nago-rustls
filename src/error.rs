@@ -20,7 +20,7 @@ pub type Result<T> = core::result::Result<T, Errno>;
 pub mod codes {
     use super::Errno;
 
-    /// The peer hung up mid handshake.
+    /// The transport ended during the handshake or before authenticated application-data closure.
     pub const CONNECTION_RESET: Errno = Errno(54);
 
     /// rustls reported a state this crate cannot continue from.
