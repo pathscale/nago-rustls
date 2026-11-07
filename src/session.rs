@@ -231,7 +231,7 @@ impl<S: ByteStream> TlsSession<S> {
 
     /// Read decrypted bytes into `buffer`.
     ///
-    /// Returns zero when the peer has closed the session cleanly.
+    /// Returns zero for an empty buffer, or for a nonempty buffer after the peer has closed cleanly.
     pub async fn read(&mut self, buffer: &mut [u8]) -> Result<usize> {
         if buffer.is_empty() {
             return Ok(0);
