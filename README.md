@@ -3,8 +3,10 @@
 Drive [rustls](https://github.com/rustls/rustls) from any async byte stream,
 with no runtime attached.
 
-No OpenSSL and no C: rustls with the `ring` provider is the whole backend,
-which is what the name is for.
+The host supplies a rustls configuration with its chosen crypto provider.
+This transport enables neither ring nor AWS-LC. Hosts using the optional
+default_client_config() helper must install their chosen process provider
+first.
 
 ## Why
 
