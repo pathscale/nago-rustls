@@ -13,22 +13,20 @@ pub type Result<T> = core::result::Result<T, Errno>;
 
 /// The handful of codes this crate reports for itself.
 ///
-/// Spelled out rather than taken from libc, which this crate would otherwise
-/// not need at all. The reset and protocol values are currently not mapped for
-/// every supported target; see `docs/TODO.md` before relying on them across
-/// platforms.
+/// These use the target's native errno values, matching the lower-level
+/// stream error convention.
 pub mod codes {
     use super::Errno;
 
     /// The transport ended during the handshake or before authenticated application-data closure.
-    pub const CONNECTION_RESET: Errno = Errno(54);
+    pub const CONNECTION_RESET: Errno = Errno(libc::ECONNRESET);
 
     /// rustls reported a state this crate cannot continue from.
     pub const IO: Errno = Errno(5);
 
     /// A protocol error from the peer: an attack, or a broken implementation.
     /// Either way the session is finished.
-    pub const PROTOCOL: Errno = Errno(100);
+    pub const PROTOCOL: Errno = Errno(libc::EPROTO);
 
     /// The far end is gone and a write has nowhere to go.
     pub const BROKEN_PIPE: Errno = Errno(32);
