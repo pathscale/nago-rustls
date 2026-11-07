@@ -18,6 +18,8 @@ default = ["webpki-roots"]
 webpki-roots = ["dep:webpki-roots"]
 
 [dependencies]
+# Target-native errno values used by the public error codes.
+libc = { version = "^0.2.189", default-features = false }
 # Already sans-io: read_tls, write_tls and process_new_packets take byte
 # buffers and know nothing about a runtime. That is why this crate is glue
 # rather than a fork.
