@@ -366,6 +366,8 @@ mod tests {
     use std::sync::mpsc::{Receiver, SyncSender};
     use std::sync::Arc as StdArc;
 
+    const PHASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
     /// A self signed certificate for `localhost`, and a client config that
     /// trusts exactly it.
     ///
@@ -639,14 +641,14 @@ mod tests {
         const PAYLOAD: &[u8] = b"truncated";
         let (server_config, client_config) = certificate();
         let (client_pipe, server_pipe) = pipes();
-        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
 
         let server = std::thread::spawn(move || {
             let session = ServerConnection::new(server_config).expect("session");
             let mut tls = TlsSession::server(server_pipe, session);
             block_on(async move {
                 tls.handshake().await.expect("handshake");
-                ready_tx.send(()).expect("signal handshake completion");
+                ready_tx.try_send(()).expect("signal handshake completion");
                 let mut buffer = [0u8; 3];
                 let mut received = Vec::new();
                 while received.len() < PAYLOAD.len() {
@@ -671,7 +673,7 @@ mod tests {
         block_on(async move {
             tls.handshake().await.expect("handshake");
             ready_rx
-                .recv()
+                .recv_timeout(PHASE_TIMEOUT)
                 .expect("server never finished its handshake");
             tls.write_all(PAYLOAD).await.expect("write payload");
             // Dropping the session drops its sending pipe without close_notify.
@@ -686,14 +688,14 @@ mod tests {
         const PAYLOAD: &[u8] = b"close-notify-payload";
         let (server_config, client_config) = certificate();
         let (client_pipe, server_pipe) = pipes();
-        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
 
         let server = std::thread::spawn(move || {
             let session = ServerConnection::new(server_config).expect("session");
             let mut tls = TlsSession::server(server_pipe, session);
             block_on(async move {
                 tls.handshake().await.expect("handshake");
-                ready_tx.send(()).expect("signal handshake completion");
+                ready_tx.try_send(()).expect("signal handshake completion");
                 let mut short = [0u8; 2];
                 let transport_reads = tls.get_ref().reads.load(Ordering::SeqCst);
                 let read = ByteStream::read(&mut tls, &mut short)
@@ -775,7 +777,7 @@ mod tests {
         block_on(async move {
             tls.handshake().await.expect("handshake");
             ready_rx
-                .recv()
+                .recv_timeout(PHASE_TIMEOUT)
                 .expect("server never finished its handshake");
             let queued = session!(tls, writer().write(PAYLOAD)).expect("queue plaintext");
             assert_eq!(queued, PAYLOAD.len());
@@ -791,21 +793,23 @@ mod tests {
         const PAYLOAD: &[u8] = b"buffered";
         let (server_config, client_config) = certificate();
         let (client_pipe, server_pipe) = pipes();
-        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
-        let (send_payload_tx, send_payload_rx) = std::sync::mpsc::sync_channel(0);
-        let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(0);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (send_payload_tx, send_payload_rx) = std::sync::mpsc::sync_channel(1);
+        let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
 
         let server = std::thread::spawn(move || {
             let session = ServerConnection::new(server_config).expect("session");
             let mut tls = TlsSession::server(server_pipe, session);
             block_on(async move {
                 tls.handshake().await.expect("handshake");
-                ready_tx.send(()).expect("signal handshake completion");
+                ready_tx.try_send(()).expect("signal handshake completion");
                 send_payload_rx
-                    .recv()
+                    .recv_timeout(PHASE_TIMEOUT)
                     .expect("client did not request payload");
                 tls.write_all(PAYLOAD).await.expect("write payload");
-                finished_rx.recv().expect("client did not finish");
+                finished_rx
+                    .recv_timeout(PHASE_TIMEOUT)
+                    .expect("client did not finish");
             });
         });
 
@@ -815,7 +819,7 @@ mod tests {
         block_on(async move {
             tls.handshake().await.expect("handshake");
             ready_rx
-                .recv()
+                .recv_timeout(PHASE_TIMEOUT)
                 .expect("server never finished its handshake");
 
             let reads = tls.get_ref().reads.load(Ordering::SeqCst);
@@ -831,7 +835,7 @@ mod tests {
             assert_eq!(tls.get_ref().writes.load(Ordering::SeqCst), writes);
 
             send_payload_tx
-                .send(())
+                .try_send(())
                 .expect("signal server to send payload");
             let mut short = [0u8; 3];
             let read = ByteStream::read(&mut tls, &mut short)
@@ -863,7 +867,7 @@ mod tests {
                 .await
                 .expect("buffered remainder");
             assert_eq!(&remainder[..read], &PAYLOAD[3..]);
-            finished_tx.send(()).expect("signal completion");
+            finished_tx.try_send(()).expect("signal completion");
         });
 
         server.join().expect("server thread");
