@@ -32,6 +32,12 @@ and a 200 KiB payload over a channel pair, no sockets involved.
 A `TlsSession` is itself a `ByteStream`, so a protocol written against the
 trait cannot tell whether it is speaking through TLS.
 
+A read returns zero only after the peer's close_notify. If the transport ends
+without one, the plaintext already received is still delivered and the next
+read fails with `CONNECTION_RESET`, so a truncated stream is never mistaken
+for a complete one. The error codes are the target's own errno values
+(`ECONNRESET`, `EPROTO`), so their numbers differ between platforms.
+
 ## What it is not
 
 Not a fork of rustls and not a TLS implementation. All the cryptography and
