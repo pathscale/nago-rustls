@@ -232,6 +232,8 @@ impl<S: ByteStream> TlsSession<S> {
     /// Read decrypted bytes into `buffer`.
     ///
     /// Returns zero for an empty buffer, or for a nonempty buffer after the peer has closed cleanly.
+    /// A transport EOF before the peer's close_notify is a truncation rather than a clean end: the
+    /// plaintext already received is still returned, then the next read fails with `CONNECTION_RESET`.
     pub async fn read(&mut self, buffer: &mut [u8]) -> Result<usize> {
         if buffer.is_empty() {
             return Ok(0);
