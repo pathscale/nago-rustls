@@ -2,14 +2,10 @@
 //!
 //! # Why there is no fork of rustls here
 //!
-//! rustls is already sans-io. [`read_tls`] takes ciphertext that arrived,
-//! [`process_new_packets`] decrypts it, and [`write_tls`] hands back
-//! ciphertext to send. None of it knows what a runtime is, so what is needed
-//! on top is a loop rather than a rewrite, and this module is that loop.
-//!
-//! [`read_tls`]: rustls::ConnectionCommon::read_tls
-//! [`write_tls`]: rustls::ConnectionCommon::write_tls
-//! [`process_new_packets`]: rustls::ConnectionCommon::process_new_packets
+//! rustls is already sans-io. Its unbuffered state machine takes ciphertext
+//! that arrived, decrypts it, and hands back ciphertext to send. None of it
+//! knows what a runtime is, so what is needed on top is a loop rather than a
+//! rewrite, and this module is that loop.
 //!
 //! # Why it is generic over the stream
 //!
@@ -31,21 +27,10 @@
 #![forbid(unsafe_code)]
 
 use alloc::vec::Vec;
-#[cfg(feature = "std")]
-use std::io::{Read as _, Write as _};
 
-/// The TLS client connection type for the active build mode.
-#[cfg(feature = "std")]
-pub use rustls::ClientConnection;
-/// The TLS server connection type for the active build mode.
-#[cfg(feature = "std")]
-pub use rustls::ServerConnection;
-
-/// The TLS client connection type for the active `no_std` build mode.
-#[cfg(not(feature = "std"))]
+/// The TLS client connection type.
 pub use rustls::client::UnbufferedClientConnection as ClientConnection;
-/// The TLS server connection type for the active `no_std` build mode.
-#[cfg(not(feature = "std"))]
+/// The TLS server connection type.
 pub use rustls::server::UnbufferedServerConnection as ServerConnection;
 
 use crate::error::{codes, Result};
@@ -61,11 +46,9 @@ pub struct TlsSession<S> {
     session: Session,
     /// Ciphertext received from the transport that has not yet been consumed by
     /// the unbuffered rustls state machine.
-    #[cfg(not(feature = "std"))]
     tls_incoming: Vec<u8>,
     /// Ciphertext encoded by the unbuffered rustls state machine waiting to be
     /// flushed to the transport.
-    #[cfg(not(feature = "std"))]
     tls_outgoing: Vec<u8>,
     /// Plaintext rustls has decrypted but the caller has not taken yet.
     incoming: Vec<u8>,
@@ -91,38 +74,13 @@ impl core::fmt::Debug for Session {
     }
 }
 
-/// Dispatch a method to whichever session is inside.
-///
-/// rustls has no object-safe trait covering both directions, and the
-/// alternative to this macro is writing every method twice.
-#[cfg(feature = "std")]
-macro_rules! session {
-    // A single call: `session!(self, wants_write())`.
-    ($self:expr, $method:ident($($argument:expr),*)) => {
-        match &mut $self.session {
-            Session::Client(session) => session.$method($($argument),*),
-            Session::Server(session) => session.$method($($argument),*),
-        }
-    };
-    // A call on what another call returned, which is how `reader()` and
-    // `writer()` are reached: `session!(self, reader().read(buffer))`.
-    ($self:expr, $outer:ident().$inner:ident($($argument:expr),*)) => {
-        match &mut $self.session {
-            Session::Client(session) => session.$outer().$inner($($argument),*),
-            Session::Server(session) => session.$outer().$inner($($argument),*),
-        }
-    };
-}
-
 impl<S: ByteStream> TlsSession<S> {
     /// Start a client session over an already connected stream.
     pub fn client(stream: S, session: ClientConnection) -> Self {
         Self {
             stream,
             session: Session::Client(alloc::boxed::Box::new(session)),
-            #[cfg(not(feature = "std"))]
             tls_incoming: Vec::new(),
-            #[cfg(not(feature = "std"))]
             tls_outgoing: Vec::new(),
             incoming: Vec::new(),
             taken: 0,
@@ -136,9 +94,7 @@ impl<S: ByteStream> TlsSession<S> {
         Self {
             stream,
             session: Session::Server(alloc::boxed::Box::new(session)),
-            #[cfg(not(feature = "std"))]
             tls_incoming: Vec::new(),
-            #[cfg(not(feature = "std"))]
             tls_outgoing: Vec::new(),
             incoming: Vec::new(),
             taken: 0,
@@ -187,186 +143,6 @@ impl<S: ByteStream> TlsSession<S> {
     }
 }
 
-#[cfg(feature = "std")]
-impl<S: ByteStream> TlsSession<S> {
-    /// Run the handshake to completion.
-    ///
-    /// Worth doing explicitly rather than letting the first read drive it: a
-    /// certificate failure should surface at connect time, not as a strange
-    /// error in the middle of the application's first message.
-    pub async fn handshake(&mut self) -> Result<()> {
-        while session!(self, is_handshaking()) {
-            let wrote = self.flush_outgoing().await?;
-            if !session!(self, is_handshaking()) {
-                break;
-            }
-            // Only wait for the peer when there was nothing left to send:
-            // reading first would deadlock a handshake whose next move is ours.
-            if !wrote && self.fill_incoming().await? == 0 {
-                return Err(codes::CONNECTION_RESET);
-            }
-        }
-        // The last flight of the handshake is still in the buffer.
-        self.flush_outgoing().await?;
-        Ok(())
-    }
-
-    /// Send everything rustls currently wants to send.
-    ///
-    /// Returns whether anything went out, which the handshake loop uses to
-    /// decide whether waiting on the peer is safe.
-    async fn flush_outgoing(&mut self) -> Result<bool> {
-        let mut sent = false;
-        while session!(self, wants_write()) {
-            let mut buffer = Vec::new();
-            // Writing into a Vec cannot fail, so the error is a rustls state
-            // problem rather than an I/O one.
-            session!(self, write_tls(&mut buffer)).map_err(|_| codes::IO)?;
-            if buffer.is_empty() {
-                break;
-            }
-            self.stream.write_all(&buffer).await?;
-            sent = true;
-        }
-        Ok(sent)
-    }
-
-    /// Read from the socket and let rustls decrypt.
-    ///
-    /// Returns how many ciphertext bytes arrived; zero means the peer closed.
-    async fn fill_incoming(&mut self) -> Result<usize> {
-        let mut chunk = [0u8; 16 * 1024];
-        let read = self.stream.read(&mut chunk).await?;
-        if read == 0 {
-            return if self.peer_closed {
-                Ok(0)
-            } else {
-                Err(codes::CONNECTION_RESET)
-            };
-        }
-
-        let mut cursor = &chunk[..read];
-        while !cursor.is_empty() {
-            // One batch at a time. `read_tls` fails with "received plaintext
-            // buffer full" while undrained plaintext is over its limit, so
-            // whatever an earlier batch decrypted is moved out first.
-            self.drain_plaintext()?;
-            // `read_tls` takes as much as its internal buffer allows, which
-            // may be less than offered, so this loops rather than assuming.
-            let taken = session!(self, read_tls(&mut cursor)).map_err(|_| codes::IO)?;
-            if taken == 0 {
-                // Only after close_notify: nothing more is read in that state.
-                break;
-            }
-            // A protocol error here is an attack, a broken peer, or a
-            // certificate refused by policy; either way the connection is
-            // finished. rustls has queued an alert saying why, so send it
-            // before giving up, and keep the error for the caller.
-            let state = match session!(self, process_new_packets()) {
-                Ok(state) => state,
-                Err(error) => {
-                    self.error = Some(error);
-                    let _ = self.flush_outgoing().await;
-                    return Err(codes::PROTOCOL);
-                }
-            };
-
-            self.peer_closed |= state.peer_has_closed();
-            if state.plaintext_bytes_to_read() > 0 {
-                self.drain_plaintext()?;
-            }
-        }
-        Ok(read)
-    }
-
-    /// Move everything rustls has decrypted into `incoming`.
-    ///
-    /// Loops and keeps only what was actually copied, so a short read can
-    /// never leave zeroed bytes posing as plaintext.
-    fn drain_plaintext(&mut self) -> Result<()> {
-        let mut chunk = [0u8; 16 * 1024];
-        loop {
-            match session!(self, reader().read(&mut chunk)) {
-                Ok(0) => break,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    return Err(codes::CONNECTION_RESET);
-                }
-                Err(_) => return Err(codes::IO),
-                Ok(copied) => self.incoming.extend_from_slice(&chunk[..copied]),
-            }
-        }
-        Ok(())
-    }
-
-    /// Read decrypted bytes into `buffer`.
-    ///
-    /// Returns zero for an empty buffer, or for a nonempty buffer after the peer has closed cleanly.
-    /// A transport EOF before the peer's close_notify is a truncation rather than a clean end: the
-    /// plaintext already received is still returned, then the next read fails with `CONNECTION_RESET`.
-    pub async fn read(&mut self, buffer: &mut [u8]) -> Result<usize> {
-        if buffer.is_empty() {
-            return Ok(0);
-        }
-        loop {
-            // Serve what has already been decrypted before going to the socket.
-            if self.taken < self.incoming.len() {
-                let available = self.incoming.len() - self.taken;
-                let take = available.min(buffer.len());
-                buffer[..take].copy_from_slice(&self.incoming[self.taken..self.taken + take]);
-                self.taken += take;
-
-                // Reset rather than grow forever once drained.
-                if self.taken == self.incoming.len() {
-                    self.incoming.clear();
-                    self.taken = 0;
-                }
-                return Ok(take);
-            }
-
-            if self.peer_closed {
-                return Ok(0);
-            }
-
-            // rustls may owe the peer a message even on a read: a key update
-            // or an alert. Not sending it stalls the session.
-            self.flush_outgoing().await?;
-
-            if self.fill_incoming().await? == 0 {
-                return Ok(0);
-            }
-        }
-    }
-
-    /// Write plaintext, encrypting and sending all of it.
-    pub async fn write_all(&mut self, buffer: &[u8]) -> Result<()> {
-        let mut written = 0;
-        while written < buffer.len() {
-            // rustls buffers the plaintext and encrypts on `write_tls`, so a
-            // short accept here just means its buffer is full and needs
-            // draining to the socket.
-            let took = session!(self, writer().write(&buffer[written..])).map_err(|_| codes::IO)?;
-            written += took;
-            self.flush_outgoing().await?;
-            if took == 0 {
-                return Err(codes::IO);
-            }
-        }
-        Ok(())
-    }
-
-    /// Send a close_notify and stop.
-    ///
-    /// Skipping this is what produces "connection reset" in a peer's logs
-    /// instead of a clean end, and it is how a truncation attack is detected.
-    pub async fn close(&mut self) -> Result<()> {
-        session!(self, send_close_notify());
-        self.flush_outgoing().await?;
-        Ok(())
-    }
-}
-
-#[cfg(not(feature = "std"))]
 enum StepOutcome {
     Encoded,
     Transmit,
@@ -375,7 +151,6 @@ enum StepOutcome {
     Closed,
 }
 
-#[cfg(not(feature = "std"))]
 fn encode_with_resize<Data>(
     mut encode_data: rustls::unbuffered::EncodeTlsData<'_, Data>,
     tls_outgoing: &mut Vec<u8>,
@@ -407,7 +182,6 @@ fn encode_with_resize<Data>(
     }
 }
 
-#[cfg(not(feature = "std"))]
 fn encrypt_with_resize<Data>(
     mut write_traffic: rustls::unbuffered::WriteTraffic<'_, Data>,
     plaintext: &[u8],
@@ -441,7 +215,6 @@ fn encrypt_with_resize<Data>(
     }
 }
 
-#[cfg(not(feature = "std"))]
 fn close_with_resize<Data>(
     mut write_traffic: rustls::unbuffered::WriteTraffic<'_, Data>,
     tls_outgoing: &mut Vec<u8>,
@@ -473,7 +246,6 @@ fn close_with_resize<Data>(
     }
 }
 
-#[cfg(not(feature = "std"))]
 fn step_unbuffered<Data>(
     status: rustls::unbuffered::UnbufferedStatus<'_, '_, Data>,
     incoming: &mut Vec<u8>,
@@ -521,7 +293,6 @@ fn step_unbuffered<Data>(
     }
 }
 
-#[cfg(not(feature = "std"))]
 impl<S: ByteStream> TlsSession<S> {
     fn is_handshaking(&self) -> bool {
         match &self.session {
@@ -612,7 +383,7 @@ impl<S: ByteStream> TlsSession<S> {
                     loop {
                         let alert_step = match &mut self.session {
                             Session::Client(session) => {
-                                let status = session.process_tls_records(&mut []);
+                                let status = session.process_tls_records(&mut self.tls_incoming);
                                 step_unbuffered(
                                     status,
                                     &mut self.incoming,
@@ -621,7 +392,7 @@ impl<S: ByteStream> TlsSession<S> {
                                 )
                             }
                             Session::Server(session) => {
-                                let status = session.process_tls_records(&mut []);
+                                let status = session.process_tls_records(&mut self.tls_incoming);
                                 step_unbuffered(
                                     status,
                                     &mut self.incoming,
@@ -631,9 +402,23 @@ impl<S: ByteStream> TlsSession<S> {
                             }
                         };
                         match alert_step {
-                            Ok((_, StepOutcome::Encoded)) => continue,
-                            Ok((_, StepOutcome::Transmit)) => {
+                            Ok((alert_discard, StepOutcome::Encoded)) => {
+                                if alert_discard > 0 {
+                                    self.tls_incoming.drain(..alert_discard);
+                                }
+                                continue;
+                            }
+                            Ok((alert_discard, StepOutcome::Transmit)) => {
+                                if alert_discard > 0 {
+                                    self.tls_incoming.drain(..alert_discard);
+                                }
                                 let _ = self.flush_tls_outgoing().await;
+                                break;
+                            }
+                            Err((alert_discard, _)) => {
+                                if alert_discard > 0 {
+                                    self.tls_incoming.drain(..alert_discard);
+                                }
                                 break;
                             }
                             _ => break,
@@ -826,25 +611,18 @@ impl<S: ByteStream> ByteStream for TlsSession<S> {
     }
 }
 
-#[cfg(all(feature = "webpki-roots", not(feature = "std")))]
-#[derive(Debug)]
-struct EkoTimeProvider;
+/// Time provider backed by `eko::time::epoch_secs()`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EkoTimeProvider;
 
-#[cfg(all(feature = "webpki-roots", not(feature = "std")))]
 impl rustls::time_provider::TimeProvider for EkoTimeProvider {
     fn current_time(&self) -> Option<rustls_pki_types::UnixTime> {
-        #[cfg(feature = "eko")]
-        {
-            let secs = eko::time::epoch_secs();
-            if secs >= 0 {
-                return Some(rustls_pki_types::UnixTime::since_unix_epoch(
-                    core::time::Duration::from_secs(secs as u64),
-                ));
-            }
-            None
-        }
-        #[cfg(not(feature = "eko"))]
-        {
+        let secs = eko::time::epoch_secs();
+        if secs >= 0 {
+            Some(rustls_pki_types::UnixTime::since_unix_epoch(
+                core::time::Duration::from_secs(secs as u64),
+            ))
+        } else {
             None
         }
     }
@@ -860,39 +638,28 @@ impl rustls::time_provider::TimeProvider for EkoTimeProvider {
 pub fn default_client_config() -> alloc::sync::Arc<rustls::ClientConfig> {
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    #[cfg(feature = "std")]
-    {
-        alloc::sync::Arc::new(
-            rustls::ClientConfig::builder()
-                .with_root_certificates(roots)
-                .with_no_client_auth(),
+    let provider = rustls::crypto::CryptoProvider::get_default()
+        .expect("no process-default rustls CryptoProvider installed")
+        .clone();
+    alloc::sync::Arc::new(
+        rustls::ClientConfig::builder_with_details(
+            provider,
+            alloc::sync::Arc::new(EkoTimeProvider),
         )
-    }
-    #[cfg(not(feature = "std"))]
-    {
-        let provider = rustls::crypto::CryptoProvider::get_default()
-            .expect("no process-default rustls CryptoProvider installed")
-            .clone();
-        alloc::sync::Arc::new(
-            rustls::ClientConfig::builder_with_details(
-                provider,
-                alloc::sync::Arc::new(EkoTimeProvider),
-            )
-            .with_safe_default_protocol_versions()
-            .expect("default protocol versions")
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-        )
-    }
+        .with_safe_default_protocol_versions()
+        .expect("default protocol versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth(),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::error::codes;
+    use alloc::string::ToString;
     use alloc::sync::Arc;
     use alloc::vec;
-    use rustls::{ClientConnection, ServerConnection};
     use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::{Receiver, SyncSender};
@@ -913,16 +680,18 @@ mod tests {
 
         // The host picks the provider; these tests pick the ECC-only one.
         let provider = Arc::new(ps_rustcrypto::provider());
-        let server = rustls::ServerConfig::builder_with_provider(provider.clone())
-            .with_safe_default_protocol_versions()
-            .expect("versions")
-            .with_no_client_auth()
-            .with_single_cert(vec![certificate.clone()], key)
-            .expect("server config");
+        let time_provider = Arc::new(EkoTimeProvider);
+        let server =
+            rustls::ServerConfig::builder_with_details(provider.clone(), time_provider.clone())
+                .with_safe_default_protocol_versions()
+                .expect("versions")
+                .with_no_client_auth()
+                .with_single_cert(vec![certificate.clone()], key)
+                .expect("server config");
 
         let mut roots = rustls::RootCertStore::empty();
         roots.add(certificate).expect("trust the test certificate");
-        let client = rustls::ClientConfig::builder_with_provider(provider)
+        let client = rustls::ClientConfig::builder_with_details(provider, time_provider)
             .with_safe_default_protocol_versions()
             .expect("versions")
             .with_root_certificates(roots)
@@ -1311,10 +1080,35 @@ mod tests {
             ready_rx
                 .recv_timeout(PHASE_TIMEOUT)
                 .expect("server never finished its handshake");
-            let queued = session!(tls, writer().write(PAYLOAD)).expect("queue plaintext");
-            assert_eq!(queued, PAYLOAD.len());
+            let _ = tls.drive_records().await.expect("drive records");
+            match &mut tls.session {
+                Session::Client(session) => {
+                    let status = session.process_tls_records(&mut tls.tls_incoming);
+                    let discard = status.discard;
+                    match status.state {
+                        Ok(rustls::unbuffered::ConnectionState::WriteTraffic(write_traffic)) => {
+                            encrypt_with_resize(write_traffic, PAYLOAD, &mut tls.tls_outgoing)
+                                .expect("queue plaintext");
+                            let status2 = session.process_tls_records(&mut []);
+                            if let Ok(rustls::unbuffered::ConnectionState::WriteTraffic(wt)) =
+                                status2.state
+                            {
+                                close_with_resize(wt, &mut tls.tls_outgoing)
+                                    .expect("queue close_notify");
+                            } else {
+                                panic!("expected WriteTraffic after encrypt");
+                            }
+                        }
+                        _ => panic!("expected WriteTraffic"),
+                    }
+                    if discard > 0 {
+                        tls.tls_incoming.drain(..discard);
+                    }
+                }
+                Session::Server(_) => unreachable!(),
+            }
             // One flush sends queued application data followed by close_notify.
-            tls.close().await.expect("close");
+            tls.flush_tls_outgoing().await.expect("flush");
         });
 
         server.join().expect("server thread");

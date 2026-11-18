@@ -1,6 +1,6 @@
 [package]
 name = "nago-rustls"
-version = "0.2.1"
+version = "0.2.2"
 publish = ["crates-io"]
 edition = "2021"
 rust-version = "1.85"
@@ -12,34 +12,27 @@ keywords = ["tls", "rustls", "sans-io", "async", "no-runtime"]
 categories = ["network-programming", "asynchronous", "cryptography"]
 
 [features]
-default = ["std", "webpki-roots"]
-std = ["dep:libc", "rustls/std", "rustls-pki-types/std"]
-eko = ["nagoya/eko", "dep:ekostd", "ekostd/libc-rs", "rustls-pki-types/alloc"]
+default = ["webpki-roots"]
+std = ["rustls/std", "rustls-pki-types/std"]
 # A ready-made client config trusting the usual roots. Off, this crate has no
 # opinion about who to trust and the caller supplies the config.
 webpki-roots = ["dep:webpki-roots"]
 
 [dependencies]
-# Target-native errno values used by the public error codes.
-libc = { version = "^0.2.189", default-features = false, optional = true }
-ekostd = { version = "^0.2.9", optional = true }
-# Already sans-io: read_tls, write_tls and process_new_packets take byte
-# buffers and know nothing about a runtime. That is why this crate is glue
-# rather than a fork.
+ekostd = { version = "^0.2.10", default-features = false }
+nagoya = { version = "^0.1.22", default-features = false }
+# Already sans-io: the unbuffered state machine takes byte buffers and knows
+# nothing about a runtime. That is why this crate is glue rather than a fork.
 # The host selects its provider explicitly. Transport must not enable ring
 # or AWS-LC through feature unification.
 rustls = { version = "^0.23", default-features = false, features = ["logging", "tls12"] }
 rustls-pki-types = { version = "^1", default-features = false, features = ["alloc"] }
 webpki-roots = { version = "^1", optional = true }
-# The byte stream trait and its error live here. nagoya is the lower layer, so
-# this direction is the only one available: nagoya cannot depend on a TLS
-# crate. Taking the definition from there rather than restating it means a
-# consumer that uses both writes no bridge.
-nagoya = { version = "^0.1.21", default-features = false }
 
 [dev-dependencies]
 # Certificates generated in process. A committed one expires and then the
 # suite fails for reasons unrelated to the code.
 rcgen = "^0.14"
 # The provider the tests run on: ECDSA and ChaCha, with no ring or AWS-LC.
-ps-rustcrypto = "^0.4"
+ps-rustcrypto = { version = "^0.6.2", features = ["rsa-pss"] }
+nagoya = { version = "^0.1.22", features = ["reactor"] }
