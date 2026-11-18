@@ -40,6 +40,7 @@
 //! A [`TlsSession`] is itself a [`ByteStream`], so a protocol written against
 //! that trait cannot tell whether it is speaking through TLS.
 
+#![cfg_attr(not(feature = "std"), no_std)]
 #![deny(missing_docs)]
 // Denied rather than forbidden so that exactly one module can opt out and say
 // why: reading this thread's errno is a dereference of a pointer libc hands
@@ -54,7 +55,7 @@ mod session;
 pub mod stream;
 
 pub use error::{Errno, Result};
-pub use session::TlsSession;
+pub use session::{ClientConnection, ServerConnection, TlsSession};
 pub use stream::ByteStream;
 
 #[cfg(feature = "webpki-roots")]
