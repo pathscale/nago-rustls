@@ -1,6 +1,6 @@
 [package]
 name = "nago-rustls"
-version = "0.2.2"
+version = "0.2.3"
 publish = ["crates-io"]
 edition = "2021"
 rust-version = "1.85"
@@ -9,18 +9,17 @@ description = "Drive caller-configured rustls from any async byte stream, with n
 repository = "https://github.com/pathscale/nago-rustls"
 readme = "README.md"
 keywords = ["tls", "rustls", "sans-io", "async", "no-runtime"]
-categories = ["network-programming", "asynchronous", "cryptography"]
+categories = ["network-programming", "asynchronous", "cryptography", "no-std"]
 
 [features]
 default = ["webpki-roots"]
-std = ["rustls/std", "rustls-pki-types/std"]
 # A ready-made client config trusting the usual roots. Off, this crate has no
 # opinion about who to trust and the caller supplies the config.
 webpki-roots = ["dep:webpki-roots"]
 
 [dependencies]
-ekostd = { version = "^0.2.10", default-features = false }
-nagoya = { version = "^0.1.22", default-features = false }
+ekostd = { version = "^0.2.11", default-features = false }
+nagoya = { version = "^0.1.24", default-features = false }
 # Already sans-io: the unbuffered state machine takes byte buffers and knows
 # nothing about a runtime. That is why this crate is glue rather than a fork.
 # The host selects its provider explicitly. Transport must not enable ring
@@ -35,4 +34,4 @@ webpki-roots = { version = "^1", optional = true }
 rcgen = "^0.14"
 # The provider the tests run on: ECDSA and ChaCha, with no ring or AWS-LC.
 ps-rustcrypto = { version = "^0.6.2", features = ["rsa-pss"] }
-nagoya = { version = "^0.1.22", features = ["reactor"] }
+nagoya = { version = "^0.1.24", features = ["reactor"] }
